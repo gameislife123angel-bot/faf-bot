@@ -1,0 +1,19 @@
+{
+  "name": "faf-bot",
+  "version": "1.0.0",
+  "description": "FaF item value tracking bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "chartjs-node-canvas": "^5.0.0",
+    "discord.js": "^14.26.3",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  }
+}
