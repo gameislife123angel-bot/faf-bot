@@ -751,8 +751,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 if (!process.env.TOKEN) {
-  // eslint-disable-next-line no-console
-  console.error("Missing TOKEN. Create a .env file with TOKEN=your_bot_token");
+  console.error("Missing TOKEN in environment variables");
   process.exit(1);
 }
 
