@@ -1,0 +1,55 @@
+{
+  "items": [
+    {
+      "id": "item_1776435081993_15643",
+      "name": "test",
+      "obtainable": "nope",
+      "demand": "2.5",
+      "rarity": "3",
+      "image": "https://www.google.com/imgres?q=imgbb%20images&imgurl=https%3A%2F%2Fcdn-1.webcatalog.io%2Fcatalog%2Fimgbb%2Fimgbb-icon-filled-256.png%3Fv%3D1733731311286&imgrefurl=https%3A%2F%2Fwebcatalog.io%2Fen%2Fapps%2Fimgbb&docid=VfKkMei4CTERSM&tbnid=pFXRfNoZfZrTqM&vet=12ahUKEwiW9Y-iiPWTAxUck68BHSYhEZMQnPAOegQIGRAB..i&w=256&h=256&hcb=2&ved=2ahUKEwiW9Y-iiPWTAxUck68BHSYhEZMQnPAOegQIGRAB",
+      "valueHistory": [
+        {
+          "value": 1000,
+          "timestamp": "2026-04-17T14:11:21.993Z"
+        },
+        {
+          "value": 500,
+          "timestamp": "2026-04-17T15:56:39.597Z"
+        },
+        {
+          "value": 650,
+          "timestamp": "2026-04-18T06:33:49.820Z"
+        }
+      ]
+    },
+    {
+      "id": "item_1776435877695_67869",
+      "name": "it works",
+      "obtainable": "lmao",
+      "demand": "LMAO",
+      "rarity": "lmao",
+      "image": "https://static.vecteezy.com/system/resources/thumbnails/057/068/323/small/single-fresh-red-strawberry-on-table-green-background-food-fruit-sweet-macro-juicy-plant-image-photo.jpg",
+      "valueHistory": [
+        {
+          "value": 5000000,
+          "timestamp": "2026-04-17T14:24:37.737Z"
+        }
+      ]
+    },
+    {
+      "id": "item_1776494129120_78974",
+      "name": "Faf",
+      "obtainable": "Nope",
+      "demand": "5",
+      "rarity": "5",
+      "image": "https://cdn.discordapp.com/ephemeral-attachments/1494700664029188137/1494949415155273808/37766B03-9212-4A14-98C8-0203B46D081A.webp?ex=69e477a3&is=69e32623&hm=52324d76eb7aba99dd9fd47aca420f0d2daad2d631af3a6d1bdc441307ff36cc&",
+      "createdAt": "2026-04-18T06:35:29.120Z",
+      "valueHistory": [
+        {
+          "value": 1000000,
+          "timestamp": "2026-04-18T06:35:29.120Z"
+        }
+      ]
+    }
+  ]
+}
