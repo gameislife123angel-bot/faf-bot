@@ -12,6 +12,7 @@ const {
   Events,
   GatewayIntentBits,
   ModalBuilder,
+  MessageFlags,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -542,6 +543,23 @@ function upsertGarageItems(userId, requestItems) {
   writeGarageDb(garageDb);
 }
 
+function buildGarageSelectRows(userId) {
+  const db = readDb();
+  const options = db.items.slice(0, 25).map((item) => ({
+    label: item.name.slice(0, 100),
+    value: item.name,
+    description: `${formatNumber(getLatestValue(item))}`.slice(0, 100),
+  }));
+  if (!options.length) return null;
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`garageadd:itemselect:${userId}`)
+    .setPlaceholder("Select up to 25 items")
+    .setMinValues(1)
+    .setMaxValues(options.length)
+    .addOptions(options);
+  return [new ActionRowBuilder().addComponents(select)];
+}
+
 const slashCommands = [
   new SlashCommandBuilder()
     .setName("additem")
@@ -654,22 +672,26 @@ client.on(Events.MessageCreate, async (message) => {
       await message.reply("Evidence must be an image file.");
       return;
     }
-
-    const openRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`garageadd:open:${message.author.id}`)
-        .setLabel("Open Garage Add Form")
-        .setStyle(ButtonStyle.Primary)
-    );
+    const rows = buildGarageSelectRows(message.author.id);
+    if (!rows) {
+      await message.reply("No items available in item list yet.");
+      return;
+    }
     client.pendingGarageAddEvidence ??= new Map();
     client.pendingGarageAddEvidence.set(message.author.id, {
       evidenceUrl: attachment.url,
       evidenceName: attachment.name || "evidence",
       sourceMessageId: message.id,
     });
+    client.pendingGarageSelections ??= new Map();
+    client.pendingGarageSelections.set(message.author.id, {
+      evidenceUrl: attachment.url,
+      evidenceName: attachment.name || "evidence",
+      selectedNames: [],
+    });
     await message.reply({
-      content: "Click the button below to continue your request form.",
-      components: [openRow],
+      content: "Select items first. After selecting, you will be asked for qty.",
+      components: rows,
     });
     return;
   }
@@ -895,31 +917,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!isImage) {
         await interaction.reply({
           content: "Evidence must be an image file.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
-
-      const modal = new ModalBuilder().setCustomId("garageadd:modal").setTitle("Garage Add Request");
-      const vehicle = new TextInputBuilder()
-        .setCustomId("vehicle_name")
-        .setLabel("Vehicle Name")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true);
-      const qtyHint = new TextInputBuilder()
-        .setCustomId("qty_map")
-        .setLabel("Optional Qty (item=qty, item2=qty)")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(false)
-        .setPlaceholder("Example: Hallowood=2, Test Item=5");
-
-      modal.addComponents(new ActionRowBuilder().addComponents(vehicle), new ActionRowBuilder().addComponents(qtyHint));
+      const rows = buildGarageSelectRows(interaction.user.id);
+      if (!rows) {
+        await interaction.reply({
+          content: "No items available in item list yet.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
       client.pendingGarageAddEvidence ??= new Map();
       client.pendingGarageAddEvidence.set(interaction.user.id, {
         evidenceUrl: evidence.url,
         evidenceName: evidence.name || "evidence",
       });
-      await interaction.showModal(modal);
+      client.pendingGarageSelections ??= new Map();
+      client.pendingGarageSelections.set(interaction.user.id, {
+        evidenceUrl: evidence.url,
+        evidenceName: evidence.name || "evidence",
+        selectedNames: [],
+      });
+      await interaction.reply({
+        content: "Select items first. After selecting, you will be asked for qty.",
+        components: rows,
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
 
@@ -970,107 +995,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.isStringSelectMenu()) {
-    if (interaction.customId === "garageadd:itemselect") {
+    if (interaction.customId.startsWith("garageadd:itemselect:")) {
+      const ownerId = interaction.customId.split(":")[2];
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({
+          content: "This selection is not for you.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
       client.pendingGarageSelections ??= new Map();
       const current = client.pendingGarageSelections.get(interaction.user.id) || {};
       current.selectedNames = interaction.values;
       client.pendingGarageSelections.set(interaction.user.id, current);
-      await interaction.reply({
-        content: `Selected **${interaction.values.length}** item(s). Click submit when ready.`,
-        ephemeral: true,
-      });
+      const modal = new ModalBuilder()
+        .setCustomId(`garageadd:qtymodal:${interaction.user.id}`)
+        .setTitle("Set Item Qty");
+      const qtyInput = new TextInputBuilder()
+        .setCustomId("qty_map")
+        .setLabel("Qty map (item=qty, item2=qty)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setPlaceholder("Example: Hallowood=2, Test Item=5");
+      modal.addComponents(new ActionRowBuilder().addComponents(qtyInput));
+      await interaction.showModal(modal);
       return;
     }
   }
 
   if (interaction.isButton()) {
-    if (interaction.customId.startsWith("garageadd:open:")) {
-      const ownerId = interaction.customId.split(":")[2];
-      if (interaction.user.id !== ownerId) {
-        await interaction.reply({ content: "This form button is not for you.", ephemeral: true });
-        return;
-      }
-      const evidence = client.pendingGarageAddEvidence?.get(interaction.user.id);
-      if (!evidence) {
-        await interaction.reply({ content: "Evidence was not found. Run `!garageadd` again.", ephemeral: true });
-        return;
-      }
-      const modal = new ModalBuilder().setCustomId("garageadd:modal").setTitle("Garage Add Request");
-      const vehicle = new TextInputBuilder()
-        .setCustomId("vehicle_name")
-        .setLabel("Vehicle Name")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true);
-      const qtyHint = new TextInputBuilder()
-        .setCustomId("qty_map")
-        .setLabel("Optional Qty (item=qty, item2=qty)")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(false)
-        .setPlaceholder("Example: Hallowood=2, Test Item=5");
-      modal.addComponents(new ActionRowBuilder().addComponents(vehicle), new ActionRowBuilder().addComponents(qtyHint));
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (interaction.customId === "garageadd:submit") {
-      const pending = client.pendingGarageSelections?.get(interaction.user.id);
-      if (!pending?.selectedNames?.length) {
-        await interaction.reply({ content: "Select at least one item first.", ephemeral: true });
-        return;
-      }
-      const requestItems = buildRequestItemsFromSelection(pending.selectedNames, pending.qtyMap || {});
-      if (!requestItems.length) {
-        await interaction.reply({ content: "Selected items are no longer valid.", ephemeral: true });
-        return;
-      }
-
-      const garageDb = readGarageDb();
-      const requestId = makeId();
-      const request = {
-        id: requestId,
-        userId: interaction.user.id,
-        username: interaction.user.tag,
-        vehicleName: pending.vehicleName || "Unknown",
-        evidenceUrl: pending.evidenceUrl,
-        items: requestItems,
-        createdAt: new Date().toISOString(),
-        status: "pending",
-      };
-      garageDb.requests.push(request);
-      writeGarageDb(garageDb);
-
-      const reviewChannel = await client.channels.fetch(config.garageRequestChannelId).catch(() => null);
-      if (reviewChannel?.isTextBased()) {
-        const reviewEmbed = new EmbedBuilder()
-          .setColor(config.embedColor || 0x25adff)
-          .setTitle("Garage Add Request")
-          .addFields(
-            { name: "User", value: `<@${interaction.user.id}> (${interaction.user.id})`, inline: false },
-            { name: "Vehicle", value: pending.vehicleName || "Unknown", inline: false },
-            {
-              name: "Items",
-              value: requestItems.map((it) => `- ${it.qty} x ${it.itemName}`).join("\n"),
-              inline: false,
-            },
-            { name: "Evidence", value: pending.evidenceUrl, inline: false }
-          )
-          .setImage(pending.evidenceUrl)
-          .setFooter({ text: "FaF Real Value" })
-          .setTimestamp();
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`garagereview:approve:${requestId}`).setLabel("Approve").setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`garagereview:decline:${requestId}`).setLabel("Decline").setStyle(ButtonStyle.Danger)
-        );
-        await reviewChannel.send({ embeds: [reviewEmbed], components: [row] });
-      }
-
-      client.pendingGarageSelections?.delete(interaction.user.id);
-      client.pendingGarageAddEvidence?.delete(interaction.user.id);
-      await interaction.reply({ content: "Request submitted for review.", ephemeral: true });
-      return;
-    }
-
     if (interaction.customId.startsWith("garagereview:")) {
       const [, action, requestId] = interaction.customId.split(":");
       if (!userCanReviewGarage(interaction.member)) {
@@ -1220,50 +1173,84 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.isModalSubmit()) {
-    if (interaction.customId === "garageadd:modal") {
-      const evidence = client.pendingGarageAddEvidence?.get(interaction.user.id);
-      if (!evidence) {
-        await interaction.reply({ content: "Evidence not found. Start again with `!garageadd` or `/garageadd`.", ephemeral: true });
+    if (interaction.customId.startsWith("garageadd:qtymodal:")) {
+      const ownerId = interaction.customId.split(":")[2];
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({
+          content: "This qty form is not for you.",
+          flags: MessageFlags.Ephemeral,
+        });
         return;
       }
-
-      const vehicleName = interaction.fields.getTextInputValue("vehicle_name").trim();
+      const pending = client.pendingGarageSelections?.get(interaction.user.id);
+      if (!pending?.selectedNames?.length || !pending?.evidenceUrl) {
+        await interaction.reply({
+          content: "Selection or evidence missing. Start again with `!garageadd` or `/garageadd`.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
       const qtyMapRaw = interaction.fields.getTextInputValue("qty_map");
       const qtyMap = parseQtyMap(qtyMapRaw);
-      const itemDb = readDb();
-      if (!itemDb.items.length) {
-        await interaction.reply({ content: "No items available in item list yet.", ephemeral: true });
+      const requestItems = buildRequestItemsFromSelection(pending.selectedNames, qtyMap);
+      if (!requestItems.length) {
+        await interaction.reply({
+          content: "Selected items are no longer valid.",
+          flags: MessageFlags.Ephemeral,
+        });
         return;
       }
 
-      const options = itemDb.items.slice(0, 25).map((item) => ({
-        label: item.name.slice(0, 100),
-        value: item.name,
-        description: `${formatNumber(getLatestValue(item))}`.slice(0, 100),
-      }));
-      const select = new StringSelectMenuBuilder()
-        .setCustomId("garageadd:itemselect")
-        .setPlaceholder("Select up to 25 items")
-        .setMinValues(1)
-        .setMaxValues(options.length)
-        .addOptions(options);
-      const selectRow = new ActionRowBuilder().addComponents(select);
-      const submitRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("garageadd:submit").setLabel("Submit Request").setStyle(ButtonStyle.Success)
+      const reviewChannel = await client.channels.fetch(config.garageRequestChannelId).catch(() => null);
+      if (!reviewChannel?.isTextBased()) {
+        await interaction.reply({
+          content: "Request channel is not available. Ask admin to check config channel ID.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const garageDb = readGarageDb();
+      const requestId = makeId();
+      const request = {
+        id: requestId,
+        userId: interaction.user.id,
+        username: interaction.user.tag,
+        evidenceUrl: pending.evidenceUrl,
+        items: requestItems,
+        createdAt: new Date().toISOString(),
+        status: "pending",
+      };
+      garageDb.requests.push(request);
+      writeGarageDb(garageDb);
+
+      const reviewEmbed = new EmbedBuilder()
+        .setColor(config.embedColor || 0x25adff)
+        .setTitle("Garage Add Request")
+        .addFields(
+          { name: "User", value: `<@${interaction.user.id}> (${interaction.user.id})`, inline: false },
+          {
+            name: "Items",
+            value: requestItems.map((it) => `- ${it.qty} x ${it.itemName}`).join("\n"),
+            inline: false,
+          },
+          { name: "Evidence", value: pending.evidenceUrl, inline: false }
+        )
+        .setImage(pending.evidenceUrl)
+        .setFooter({ text: "FaF Real Value" })
+        .setTimestamp();
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`garagereview:approve:${requestId}`).setLabel("Approve").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`garagereview:decline:${requestId}`).setLabel("Decline").setStyle(ButtonStyle.Danger)
       );
+      await reviewChannel.send({ embeds: [reviewEmbed], components: [row] });
 
-      client.pendingGarageSelections ??= new Map();
-      client.pendingGarageSelections.set(interaction.user.id, {
-        vehicleName,
-        qtyMap,
-        evidenceUrl: evidence.evidenceUrl,
-      });
-
+      client.pendingGarageSelections?.delete(interaction.user.id);
+      client.pendingGarageAddEvidence?.delete(interaction.user.id);
       await interaction.reply({
-        content:
-          "Select your items, then press **Submit Request**.\nQty is optional and comes from your form text.",
-        components: [selectRow, submitRow],
-        ephemeral: true,
+        content: "Request submitted for review.",
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
