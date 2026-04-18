@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const fs = require("node:fs");
@@ -407,6 +406,12 @@ const slashCommands = [
     .addAttachmentOption((opt) =>
       opt.setName("image").setDescription("New image upload (optional)").setRequired(false)
     ),
+  new SlashCommandBuilder()
+    .setName("deleteitem")
+    .setDescription("Delete an existing item")
+    .addStringOption((opt) =>
+      opt.setName("itemname").setDescription("Name of the item to delete").setRequired(true)
+    ),
 ].map((command) => command.toJSON());
 
 async function registerCommands() {
@@ -600,9 +605,86 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       return;
     }
+
+    if (interaction.commandName === "deleteitem") {
+      const itemName = interaction.options.getString("itemname", true).trim();
+      const db = readDb();
+      const item = db.items.find((entry) => entry.name.toLowerCase() === itemName.toLowerCase());
+
+      if (!item) {
+        await interaction.reply({
+          content: `Item not found: **${itemName}**`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`deleteitem:confirm:${item.id}:${interaction.user.id}`)
+          .setLabel("Yes")
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`deleteitem:cancel:${item.id}:${interaction.user.id}`)
+          .setLabel("No")
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      await interaction.reply({
+        content: `Are you sure you want to delete **${item.name}**?`,
+        components: [row],
+        ephemeral: true,
+      });
+      return;
+    }
   }
 
   if (interaction.isButton()) {
+    if (interaction.customId.startsWith("deleteitem:")) {
+      const [, action, itemId, ownerId] = interaction.customId.split(":");
+
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({
+          content: "This confirmation is not for you.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (action === "cancel") {
+        await interaction.update({
+          content: "Deletion cancelled. Item was kept.",
+          components: [],
+        });
+        return;
+      }
+
+      if (action === "confirm") {
+        const db = readDb();
+        const idx = db.items.findIndex((entry) => entry.id === itemId);
+
+        if (idx === -1) {
+          await interaction.update({
+            content: "Item was already deleted or no longer exists.",
+            components: [],
+          });
+          return;
+        }
+
+        const deleted = db.items[idx];
+        db.items.splice(idx, 1);
+        writeDb(db);
+
+        await interaction.update({
+          content: `Deleted item: **${deleted.name}**`,
+          components: [],
+        });
+        return;
+      }
+
+      return;
+    }
+
     const [name, action, value, pageRaw, pricingRaw, itemRaw] = interaction.customId.split(":");
     if (name !== "itemlist") return;
 
@@ -752,7 +834,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 if (!process.env.TOKEN) {
-  console.error("Missing TOKEN in environment variables");
+  // eslint-disable-next-line no-console
+  console.error("Missing TOKEN. Create a .env file with TOKEN=your_bot_token");
   process.exit(1);
 }
 
