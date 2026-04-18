@@ -409,21 +409,14 @@ const slashCommands = [
       opt.setName("image").setDescription("New image upload (optional)").setRequired(false)
     ),
 
-  // ✅ NEW DELETE COMMAND
-  new SlashCommandBuilder()
-    .setName("deleteitem")
-    .setDescription("Delete an item from database")
-    .addStringOption((opt) =>
-      opt.setName("item_name").setDescription("Item name to delete").setRequired(true)
-    ),
-].map((command) => command.toJSON());
-
+const slashCommands = [
   new SlashCommandBuilder()
     .setName("additem")
     .setDescription("Add a new FaF item")
     .addAttachmentOption((opt) =>
       opt.setName("image").setDescription("Upload item image").setRequired(true)
     ),
+
   new SlashCommandBuilder()
     .setName("edititem")
     .setDescription("Edit an existing item")
@@ -432,6 +425,13 @@ const slashCommands = [
     )
     .addAttachmentOption((opt) =>
       opt.setName("image").setDescription("New image upload (optional)").setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("deleteitem")
+    .setDescription("Delete an item from database")
+    .addStringOption((opt) =>
+      opt.setName("item_name").setDescription("Item name to delete").setRequired(true)
     ),
 ].map((command) => command.toJSON());
 
