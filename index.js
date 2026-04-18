@@ -15,6 +15,7 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
@@ -47,6 +48,8 @@ function halfstarEmoji() {
 const ITEMS_PER_PAGE = 10;
 const GRAPH_WIDTH = 1000;
 const GRAPH_HEIGHT = 420;
+const GARAGE_PAGE_SIZE = 10;
+const GARAGE_DB_PATH = "./data/garages.json";
 
 const chartCanvas = new ChartJSNodeCanvas({
   width: GRAPH_WIDTH,
@@ -76,6 +79,31 @@ function readDb() {
 
 function writeDb(db) {
   fs.writeFileSync(path.resolve(config.databasePath), JSON.stringify(db, null, 2), "utf8");
+}
+
+function ensureGarageFile() {
+  const resolvedPath = path.resolve(GARAGE_DB_PATH);
+  const dir = path.dirname(resolvedPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  if (!fs.existsSync(resolvedPath)) {
+    fs.writeFileSync(resolvedPath, JSON.stringify({ requests: [], garages: {} }, null, 2), "utf8");
+  }
+}
+
+function readGarageDb() {
+  ensureGarageFile();
+  const raw = fs.readFileSync(path.resolve(GARAGE_DB_PATH), "utf8");
+  const parsed = JSON.parse(raw);
+  return {
+    requests: Array.isArray(parsed.requests) ? parsed.requests : [],
+    garages: parsed.garages && typeof parsed.garages === "object" ? parsed.garages : {},
+  };
+}
+
+function writeGarageDb(db) {
+  fs.writeFileSync(path.resolve(GARAGE_DB_PATH), JSON.stringify(db, null, 2), "utf8");
 }
 
 function makeId() {
@@ -390,6 +418,130 @@ function userIsAdmin(member) {
   return member.roles?.cache?.has(config.adminRoleId);
 }
 
+function userCanReviewGarage(member) {
+  return member.roles?.cache?.has(config.garageReviewerRoleId);
+}
+
+function parseLookupTarget(raw) {
+  const match = String(raw || "").match(/\d{17,20}/);
+  return match ? match[0] : null;
+}
+
+function parseQtyMap(rawText) {
+  const map = {};
+  const text = String(rawText || "").trim();
+  if (!text) return map;
+  const parts = text.split(",");
+  for (const part of parts) {
+    const [left, right] = part.split("=");
+    if (!left || !right) continue;
+    const name = left.trim().toLowerCase();
+    const qty = Number(right.trim());
+    if (!name || !Number.isFinite(qty) || qty <= 0) continue;
+    map[name] = Math.floor(qty);
+  }
+  return map;
+}
+
+function buildRequestItemsFromSelection(selectedNames, qtyMap) {
+  const db = readDb();
+  const out = [];
+  for (const name of selectedNames) {
+    const item = db.items.find((entry) => entry.name.toLowerCase() === name.toLowerCase());
+    if (!item) continue;
+    const qty = qtyMap[item.name.toLowerCase()] || 1;
+    out.push({ itemId: item.id, itemName: item.name, qty: Math.max(1, Math.min(9999, qty)) });
+  }
+  return out;
+}
+
+function getGarageEntriesForUser(userId) {
+  const garageDb = readGarageDb();
+  const userEntries = Array.isArray(garageDb.garages[userId]) ? garageDb.garages[userId] : [];
+  const itemDb = readDb();
+  const rows = userEntries
+    .map((entry) => {
+      const item = itemDb.items.find((it) => it.id === entry.itemId || it.name === entry.itemName);
+      if (!item) return null;
+      const qty = Math.max(1, Number(entry.qty) || 1);
+      const unitValue = getLatestValue(item);
+      return {
+        itemId: item.id,
+        itemName: item.name,
+        qty,
+        unitValue,
+        totalValue: unitValue * qty,
+      };
+    })
+    .filter(Boolean);
+  return rows;
+}
+
+function buildGarageLookupEmbed(targetUser, rows, page = 1) {
+  const totalPages = Math.max(1, Math.ceil(rows.length / GARAGE_PAGE_SIZE));
+  const safePage = Math.max(1, Math.min(page, totalPages));
+  const start = (safePage - 1) * GARAGE_PAGE_SIZE;
+  const selected = rows.slice(start, start + GARAGE_PAGE_SIZE);
+  const totalValue = rows.reduce((sum, row) => sum + row.totalValue, 0);
+  const totalQty = rows.reduce((sum, row) => sum + row.qty, 0);
+  const description = selected.length
+    ? selected
+        .map((row, idx) => `${start + idx + 1}. ${row.qty} - ${row.itemName} - ${formatNumber(row.totalValue)}`)
+        .join("\n")
+    : "No garage items.";
+
+  const embed = new EmbedBuilder()
+    .setColor(config.embedColor || 0x25adff)
+    .setAuthor({
+      name: `${targetUser.username}'s Garage`,
+      iconURL: targetUser.displayAvatarURL(),
+    })
+    .setDescription(description)
+    .addFields(
+      { name: "Total Qty", value: formatNumber(totalQty), inline: true },
+      { name: "Total Value", value: `${coinsEmoji()} ${formatNumber(totalValue)}`, inline: true }
+    )
+    .setFooter({ text: `FaF Real Value • Page ${safePage}/${totalPages}` })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`garagelookup:prev:${targetUser.id}:${safePage}`)
+      .setLabel("Previous")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safePage <= 1),
+    new ButtonBuilder()
+      .setCustomId(`garagelookup:next:${targetUser.id}:${safePage}`)
+      .setLabel("Next")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(safePage >= totalPages)
+  );
+
+  return { embed, row };
+}
+
+function upsertGarageItems(userId, requestItems) {
+  const garageDb = readGarageDb();
+  const current = Array.isArray(garageDb.garages[userId]) ? garageDb.garages[userId] : [];
+  const byItemId = new Map(current.map((entry) => [entry.itemId || entry.itemName, { ...entry }]));
+
+  for (const reqItem of requestItems) {
+    const key = reqItem.itemId || reqItem.itemName;
+    const existing = byItemId.get(key);
+    if (existing) {
+      existing.qty = (Number(existing.qty) || 0) + (Number(reqItem.qty) || 1);
+      existing.itemName = reqItem.itemName;
+      existing.itemId = reqItem.itemId;
+      byItemId.set(key, existing);
+    } else {
+      byItemId.set(key, { itemId: reqItem.itemId, itemName: reqItem.itemName, qty: Number(reqItem.qty) || 1 });
+    }
+  }
+
+  garageDb.garages[userId] = [...byItemId.values()];
+  writeGarageDb(garageDb);
+}
+
 const slashCommands = [
   new SlashCommandBuilder()
     .setName("additem")
@@ -411,6 +563,26 @@ const slashCommands = [
     .setDescription("Delete an existing item")
     .addStringOption((opt) =>
       opt.setName("itemname").setDescription("Name of the item to delete").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("garageadd")
+    .setDescription("Submit a garage add request")
+    .addAttachmentOption((opt) =>
+      opt.setName("evidence").setDescription("Upload valid evidence image").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("garagedelete")
+    .setDescription("Delete a user's full garage")
+    .addUserOption((opt) => opt.setName("user").setDescription("Target user").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("garageedituser")
+    .setDescription("Edit user garage item quantity")
+    .addUserOption((opt) => opt.setName("user").setDescription("Target user").setRequired(true))
+    .addStringOption((opt) =>
+      opt.setName("item_name").setDescription("Item name to edit").setRequired(true)
+    )
+    .addIntegerOption((opt) =>
+      opt.setName("qty").setDescription("New qty (0 to remove)").setRequired(true).setMinValue(0)
     ),
 ].map((command) => command.toJSON());
 
@@ -468,11 +640,88 @@ client.on(Events.MessageCreate, async (message) => {
     const { embed, rows } = buildItemListEmbed(1, "n", "n");
     await message.reply({ embeds: [embed], components: rows });
   }
+
+  if (cmd === "garageadd") {
+    const attachment = message.attachments.first();
+    if (!attachment) {
+      await message.reply("Attach an evidence image with `!garageadd`.");
+      return;
+    }
+    const isImage =
+      Boolean(attachment.contentType?.startsWith("image/")) ||
+      /\.(png|jpe?g|gif|webp)$/i.test(attachment.name || "");
+    if (!isImage) {
+      await message.reply("Evidence must be an image file.");
+      return;
+    }
+
+    const openRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`garageadd:open:${message.author.id}`)
+        .setLabel("Open Garage Add Form")
+        .setStyle(ButtonStyle.Primary)
+    );
+    client.pendingGarageAddEvidence ??= new Map();
+    client.pendingGarageAddEvidence.set(message.author.id, {
+      evidenceUrl: attachment.url,
+      evidenceName: attachment.name || "evidence",
+      sourceMessageId: message.id,
+    });
+    await message.reply({
+      content: "Click the button below to continue your request form.",
+      components: [openRow],
+    });
+    return;
+  }
+
+  if (cmd === "lookup") {
+    const targetRaw = rest.join(" ").trim();
+    const targetId = parseLookupTarget(targetRaw);
+    if (!targetId) {
+      await message.reply("Use: `!lookup <@user|userId>`");
+      return;
+    }
+
+    try {
+      const targetUser = await client.users.fetch(targetId);
+      const rows = getGarageEntriesForUser(targetId);
+      const { embed, row } = buildGarageLookupEmbed(targetUser, rows, 1);
+      await message.reply({ embeds: [embed], components: [row] });
+    } catch (error) {
+      await message.reply("Could not find that user.");
+    }
+    return;
+  }
+
+  if (cmd === "leaderboard") {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("garageleader:value:1")
+        .setLabel("Value")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId("garageleader:qty:1")
+        .setLabel("Qty")
+        .setStyle(ButtonStyle.Secondary)
+    );
+    await message.reply({
+      content: "Choose leaderboard type:",
+      components: [row],
+    });
+    return;
+  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isChatInputCommand()) {
-    if (!userIsAdmin(interaction.member)) {
+    const adminOnlyCommands = new Set([
+      "additem",
+      "edititem",
+      "deleteitem",
+      "garagedelete",
+      "garageedituser",
+    ]);
+    if (adminOnlyCommands.has(interaction.commandName) && !userIsAdmin(interaction.member)) {
       await interaction.reply({
         content: "You do not have permission to use this command.",
         ephemeral: true,
@@ -637,9 +886,265 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return;
     }
+
+    if (interaction.commandName === "garageadd") {
+      const evidence = interaction.options.getAttachment("evidence", true);
+      const isImage =
+        Boolean(evidence.contentType?.startsWith("image/")) ||
+        /\.(png|jpe?g|gif|webp)$/i.test(evidence.name || "");
+      if (!isImage) {
+        await interaction.reply({
+          content: "Evidence must be an image file.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const modal = new ModalBuilder().setCustomId("garageadd:modal").setTitle("Garage Add Request");
+      const vehicle = new TextInputBuilder()
+        .setCustomId("vehicle_name")
+        .setLabel("Vehicle Name")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+      const qtyHint = new TextInputBuilder()
+        .setCustomId("qty_map")
+        .setLabel("Optional Qty (item=qty, item2=qty)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false)
+        .setPlaceholder("Example: Hallowood=2, Test Item=5");
+
+      modal.addComponents(new ActionRowBuilder().addComponents(vehicle), new ActionRowBuilder().addComponents(qtyHint));
+      client.pendingGarageAddEvidence ??= new Map();
+      client.pendingGarageAddEvidence.set(interaction.user.id, {
+        evidenceUrl: evidence.url,
+        evidenceName: evidence.name || "evidence",
+      });
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.commandName === "garagedelete") {
+      const target = interaction.options.getUser("user", true);
+      const garageDb = readGarageDb();
+      delete garageDb.garages[target.id];
+      writeGarageDb(garageDb);
+      await interaction.reply({
+        content: `Deleted full garage for <@${target.id}>.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.commandName === "garageedituser") {
+      const target = interaction.options.getUser("user", true);
+      const itemName = interaction.options.getString("item_name", true).trim();
+      const qty = interaction.options.getInteger("qty", true);
+      const item = findItemByName(itemName);
+      if (!item) {
+        await interaction.reply({ content: `Item not found: **${itemName}**`, ephemeral: true });
+        return;
+      }
+
+      const garageDb = readGarageDb();
+      const entries = Array.isArray(garageDb.garages[target.id]) ? garageDb.garages[target.id] : [];
+      const idx = entries.findIndex((entry) => entry.itemId === item.id || entry.itemName === item.name);
+
+      if (qty === 0) {
+        if (idx >= 0) entries.splice(idx, 1);
+      } else if (idx >= 0) {
+        entries[idx].qty = qty;
+        entries[idx].itemName = item.name;
+        entries[idx].itemId = item.id;
+      } else {
+        entries.push({ itemId: item.id, itemName: item.name, qty });
+      }
+
+      garageDb.garages[target.id] = entries;
+      writeGarageDb(garageDb);
+      await interaction.reply({
+        content: `Garage updated for <@${target.id}>: **${item.name}** qty is now **${qty}**.`,
+        ephemeral: true,
+      });
+      return;
+    }
+  }
+
+  if (interaction.isStringSelectMenu()) {
+    if (interaction.customId === "garageadd:itemselect") {
+      client.pendingGarageSelections ??= new Map();
+      const current = client.pendingGarageSelections.get(interaction.user.id) || {};
+      current.selectedNames = interaction.values;
+      client.pendingGarageSelections.set(interaction.user.id, current);
+      await interaction.reply({
+        content: `Selected **${interaction.values.length}** item(s). Click submit when ready.`,
+        ephemeral: true,
+      });
+      return;
+    }
   }
 
   if (interaction.isButton()) {
+    if (interaction.customId.startsWith("garageadd:open:")) {
+      const ownerId = interaction.customId.split(":")[2];
+      if (interaction.user.id !== ownerId) {
+        await interaction.reply({ content: "This form button is not for you.", ephemeral: true });
+        return;
+      }
+      const evidence = client.pendingGarageAddEvidence?.get(interaction.user.id);
+      if (!evidence) {
+        await interaction.reply({ content: "Evidence was not found. Run `!garageadd` again.", ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder().setCustomId("garageadd:modal").setTitle("Garage Add Request");
+      const vehicle = new TextInputBuilder()
+        .setCustomId("vehicle_name")
+        .setLabel("Vehicle Name")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+      const qtyHint = new TextInputBuilder()
+        .setCustomId("qty_map")
+        .setLabel("Optional Qty (item=qty, item2=qty)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false)
+        .setPlaceholder("Example: Hallowood=2, Test Item=5");
+      modal.addComponents(new ActionRowBuilder().addComponents(vehicle), new ActionRowBuilder().addComponents(qtyHint));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.customId === "garageadd:submit") {
+      const pending = client.pendingGarageSelections?.get(interaction.user.id);
+      if (!pending?.selectedNames?.length) {
+        await interaction.reply({ content: "Select at least one item first.", ephemeral: true });
+        return;
+      }
+      const requestItems = buildRequestItemsFromSelection(pending.selectedNames, pending.qtyMap || {});
+      if (!requestItems.length) {
+        await interaction.reply({ content: "Selected items are no longer valid.", ephemeral: true });
+        return;
+      }
+
+      const garageDb = readGarageDb();
+      const requestId = makeId();
+      const request = {
+        id: requestId,
+        userId: interaction.user.id,
+        username: interaction.user.tag,
+        vehicleName: pending.vehicleName || "Unknown",
+        evidenceUrl: pending.evidenceUrl,
+        items: requestItems,
+        createdAt: new Date().toISOString(),
+        status: "pending",
+      };
+      garageDb.requests.push(request);
+      writeGarageDb(garageDb);
+
+      const reviewChannel = await client.channels.fetch(config.garageRequestChannelId).catch(() => null);
+      if (reviewChannel?.isTextBased()) {
+        const reviewEmbed = new EmbedBuilder()
+          .setColor(config.embedColor || 0x25adff)
+          .setTitle("Garage Add Request")
+          .addFields(
+            { name: "User", value: `<@${interaction.user.id}> (${interaction.user.id})`, inline: false },
+            { name: "Vehicle", value: pending.vehicleName || "Unknown", inline: false },
+            {
+              name: "Items",
+              value: requestItems.map((it) => `- ${it.qty} x ${it.itemName}`).join("\n"),
+              inline: false,
+            },
+            { name: "Evidence", value: pending.evidenceUrl, inline: false }
+          )
+          .setImage(pending.evidenceUrl)
+          .setFooter({ text: "FaF Real Value" })
+          .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`garagereview:approve:${requestId}`).setLabel("Approve").setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`garagereview:decline:${requestId}`).setLabel("Decline").setStyle(ButtonStyle.Danger)
+        );
+        await reviewChannel.send({ embeds: [reviewEmbed], components: [row] });
+      }
+
+      client.pendingGarageSelections?.delete(interaction.user.id);
+      client.pendingGarageAddEvidence?.delete(interaction.user.id);
+      await interaction.reply({ content: "Request submitted for review.", ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith("garagereview:")) {
+      const [, action, requestId] = interaction.customId.split(":");
+      if (!userCanReviewGarage(interaction.member)) {
+        await interaction.reply({ content: "You cannot review garage requests.", ephemeral: true });
+        return;
+      }
+      const modal = new ModalBuilder().setCustomId(`garagereviewreason:${action}:${requestId}`).setTitle("Review Reason");
+      const reason = new TextInputBuilder()
+        .setCustomId("reason")
+        .setLabel("Reason")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true);
+      modal.addComponents(new ActionRowBuilder().addComponents(reason));
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.customId.startsWith("garageleader:")) {
+      const [, mode] = interaction.customId.split(":");
+      const garageDb = readGarageDb();
+      const scores = Object.entries(garageDb.garages).map(([userId, entries]) => {
+        const rows = getGarageEntriesForUser(userId);
+        return {
+          userId,
+          qty: rows.reduce((sum, r) => sum + r.qty, 0),
+          value: rows.reduce((sum, r) => sum + r.totalValue, 0),
+        };
+      });
+      scores.sort((a, b) => (mode === "qty" ? b.qty - a.qty : b.value - a.value));
+      const top = scores.slice(0, 10);
+      const desc = top.length
+        ? top
+            .map((row, idx) =>
+              mode === "qty"
+                ? `${idx + 1}. <@${row.userId}> - ${formatNumber(row.qty)}`
+                : `${idx + 1}. <@${row.userId}> - ${coinsEmoji()} ${formatNumber(row.value)}`
+            )
+            .join("\n")
+        : "No garage data yet.";
+      const embed = new EmbedBuilder()
+        .setColor(config.embedColor || 0x25adff)
+        .setTitle(mode === "qty" ? "Garage Leaderboard (Qty)" : "Garage Leaderboard (Value)")
+        .setDescription(desc)
+        .setFooter({ text: "FaF Real Value" })
+        .setTimestamp();
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("garageleader:value:1")
+          .setLabel("Value")
+          .setStyle(mode === "value" ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("garageleader:qty:1")
+          .setLabel("Qty")
+          .setStyle(mode === "qty" ? ButtonStyle.Success : ButtonStyle.Secondary)
+      );
+      await interaction.update({ embeds: [embed], components: [row], content: "" });
+      return;
+    }
+
+    if (interaction.customId.startsWith("garagelookup:")) {
+      const [, dir, targetId, pageRaw] = interaction.customId.split(":");
+      const currentPage = Number(pageRaw) || 1;
+      const nextPage = dir === "next" ? currentPage + 1 : currentPage - 1;
+      const targetUser = await client.users.fetch(targetId).catch(() => null);
+      if (!targetUser) {
+        await interaction.reply({ content: "User not found.", ephemeral: true });
+        return;
+      }
+      const rows = getGarageEntriesForUser(targetId);
+      const { embed, row } = buildGarageLookupEmbed(targetUser, rows, nextPage);
+      await interaction.update({ embeds: [embed], components: [row] });
+      return;
+    }
+
     if (interaction.customId.startsWith("deleteitem:")) {
       const [, action, itemId, ownerId] = interaction.customId.split(":");
 
@@ -715,6 +1220,99 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.isModalSubmit()) {
+    if (interaction.customId === "garageadd:modal") {
+      const evidence = client.pendingGarageAddEvidence?.get(interaction.user.id);
+      if (!evidence) {
+        await interaction.reply({ content: "Evidence not found. Start again with `!garageadd` or `/garageadd`.", ephemeral: true });
+        return;
+      }
+
+      const vehicleName = interaction.fields.getTextInputValue("vehicle_name").trim();
+      const qtyMapRaw = interaction.fields.getTextInputValue("qty_map");
+      const qtyMap = parseQtyMap(qtyMapRaw);
+      const itemDb = readDb();
+      if (!itemDb.items.length) {
+        await interaction.reply({ content: "No items available in item list yet.", ephemeral: true });
+        return;
+      }
+
+      const options = itemDb.items.slice(0, 25).map((item) => ({
+        label: item.name.slice(0, 100),
+        value: item.name,
+        description: `${formatNumber(getLatestValue(item))}`.slice(0, 100),
+      }));
+      const select = new StringSelectMenuBuilder()
+        .setCustomId("garageadd:itemselect")
+        .setPlaceholder("Select up to 25 items")
+        .setMinValues(1)
+        .setMaxValues(options.length)
+        .addOptions(options);
+      const selectRow = new ActionRowBuilder().addComponents(select);
+      const submitRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("garageadd:submit").setLabel("Submit Request").setStyle(ButtonStyle.Success)
+      );
+
+      client.pendingGarageSelections ??= new Map();
+      client.pendingGarageSelections.set(interaction.user.id, {
+        vehicleName,
+        qtyMap,
+        evidenceUrl: evidence.evidenceUrl,
+      });
+
+      await interaction.reply({
+        content:
+          "Select your items, then press **Submit Request**.\nQty is optional and comes from your form text.",
+        components: [selectRow, submitRow],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.customId.startsWith("garagereviewreason:")) {
+      const [, action, requestId] = interaction.customId.split(":");
+      if (!userCanReviewGarage(interaction.member)) {
+        await interaction.reply({ content: "You cannot review garage requests.", ephemeral: true });
+        return;
+      }
+
+      const reason = interaction.fields.getTextInputValue("reason").trim();
+      const garageDb = readGarageDb();
+      const request = garageDb.requests.find((entry) => entry.id === requestId);
+      if (!request || request.status !== "pending") {
+        await interaction.reply({ content: "Request not found or already processed.", ephemeral: true });
+        return;
+      }
+
+      request.status = action === "approve" ? "approved" : "declined";
+      request.reviewedBy = interaction.user.id;
+      request.reviewedAt = new Date().toISOString();
+      request.reviewReason = reason;
+      writeGarageDb(garageDb);
+
+      if (action === "approve") {
+        upsertGarageItems(request.userId, request.items);
+      }
+
+      const decisionLines = request.items.map((it) => `- ${it.qty} x ${it.itemName}`).join("\n");
+      const targetUser = await client.users.fetch(request.userId).catch(() => null);
+      if (targetUser) {
+        if (action === "approve") {
+          await targetUser.send(
+            `Your request to add in garage was accepted for following:\n${decisionLines}\nApproved by: ${interaction.user.tag}\nTimestamp: ${new Date().toLocaleString()}`
+          );
+        } else {
+          await targetUser.send(
+            `Your request has been declined to upload following items:\n${decisionLines}\nDeclined by: ${interaction.user.tag}\nTimestamp: ${new Date().toLocaleString()}\nReason: ${reason}`
+          );
+        }
+      }
+
+      const statusText = action === "approve" ? "Approved" : "Declined";
+      await interaction.reply({ content: `${statusText} request ${requestId}.`, ephemeral: true });
+      await interaction.message.edit({ components: [] }).catch(() => null);
+      return;
+    }
+
     if (!userIsAdmin(interaction.member)) {
       await interaction.reply({
         content: "You do not have permission to submit this form.",
