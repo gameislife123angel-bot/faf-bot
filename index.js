@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const fs = require("node:fs");
@@ -397,6 +398,32 @@ const slashCommands = [
     .addAttachmentOption((opt) =>
       opt.setName("image").setDescription("Upload item image").setRequired(true)
     ),
+
+  new SlashCommandBuilder()
+    .setName("edititem")
+    .setDescription("Edit an existing item")
+    .addStringOption((opt) =>
+      opt.setName("old_item_name").setDescription("Existing item name").setRequired(true)
+    )
+    .addAttachmentOption((opt) =>
+      opt.setName("image").setDescription("New image upload (optional)").setRequired(false)
+    ),
+
+  // ✅ NEW DELETE COMMAND
+  new SlashCommandBuilder()
+    .setName("deleteitem")
+    .setDescription("Delete an item from database")
+    .addStringOption((opt) =>
+      opt.setName("item_name").setDescription("Item name to delete").setRequired(true)
+    ),
+].map((command) => command.toJSON());
+
+  new SlashCommandBuilder()
+    .setName("additem")
+    .setDescription("Add a new FaF item")
+    .addAttachmentOption((opt) =>
+      opt.setName("image").setDescription("Upload item image").setRequired(true)
+    ),
   new SlashCommandBuilder()
     .setName("edititem")
     .setDescription("Edit an existing item")
@@ -527,7 +554,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    if (interaction.commandName === "edititem") {
+    if (interaction.commandName === "deleteitem") {
+  const itemName = interaction.options.getString("item_name", true);
+  const db = readDb();
+  const item = db.items.find(
+    (entry) => entry.name.toLowerCase() === itemName.toLowerCase()
+  );
+
+  if (!item) {
+    await interaction.reply({
+      content: `Item not found: **${itemName}**`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`delete_confirm:${item.id}`)
+      .setLabel("Yes")
+      .setStyle(ButtonStyle.Danger),
+
+    new ButtonBuilder()
+      .setCustomId(`delete_cancel:${item.id}`)
+      .setLabel("No")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  await interaction.reply({
+    content: `⚠️ Are you sure you want to delete **${item.name}**?`,
+    components: [row],
+    ephemeral: true,
+  });
+
+  return;
+}
       const oldItemName = interaction.options.getString("old_item_name", true);
       const newImageAttachment = interaction.options.getAttachment("image");
       const db = readDb();
@@ -601,35 +662,83 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  if (interaction.isButton()) {
-    const [name, action, value, pageRaw, pricingRaw, itemRaw] = interaction.customId.split(":");
-    if (name !== "itemlist") return;
+ if (interaction.isButton()) {
 
-    const currentPage = Number(pageRaw) || 1;
-    let pricingSort = pricingRaw || "n";
-    let itemSort = itemRaw || "n";
-    let nextPage = currentPage;
-
-    if (action === "nav") {
-      nextPage = value === "next" ? currentPage + 1 : currentPage - 1;
-    } else if (action === "pricing") {
-      pricingSort = value;
-      nextPage = 1;
-    } else if (action === "items") {
-      itemSort = value;
-      nextPage = 1;
-    } else if (action === "clear") {
-      pricingSort = "n";
-      itemSort = "n";
-      nextPage = 1;
-    } else {
+  // ======================
+  // ✅ DELETE HANDLER FIRST
+  // ======================
+  if (interaction.customId.startsWith("delete_")) {
+    if (!userIsAdmin(interaction.member)) {
+      await interaction.reply({
+        content: "You do not have permission.",
+        ephemeral: true,
+      });
       return;
     }
 
-    const { embed, rows } = buildItemListEmbed(nextPage, pricingSort, itemSort);
-    await interaction.update({ embeds: [embed], components: rows });
+    const [action, itemId] = interaction.customId.split(":");
+    const db = readDb();
+    const itemIndex = db.items.findIndex((i) => i.id === itemId);
+
+    if (itemIndex === -1) {
+      await interaction.update({
+        content: "Item already deleted or not found.",
+        components: [],
+      });
+      return;
+    }
+
+    const itemName = db.items[itemIndex].name;
+
+    if (action === "delete_confirm") {
+      db.items.splice(itemIndex, 1);
+      writeDb(db);
+
+      await interaction.update({
+        content: `✅ Item deleted: **${itemName}**`,
+        components: [],
+      });
+    } else if (action === "delete_cancel") {
+      await interaction.update({
+        content: `❌ Deletion cancelled for **${itemName}**`,
+        components: [],
+      });
+    }
+
     return;
   }
+
+  // ======================
+  // 📦 YOUR EXISTING CODE
+  // ======================
+  const [name, action, value, pageRaw, pricingRaw, itemRaw] = interaction.customId.split(":");
+  if (name !== "itemlist") return;
+
+  const currentPage = Number(pageRaw) || 1;
+  let pricingSort = pricingRaw || "n";
+  let itemSort = itemRaw || "n";
+  let nextPage = currentPage;
+
+  if (action === "nav") {
+    nextPage = value === "next" ? currentPage + 1 : currentPage - 1;
+  } else if (action === "pricing") {
+    pricingSort = value;
+    nextPage = 1;
+  } else if (action === "items") {
+    itemSort = value;
+    nextPage = 1;
+  } else if (action === "clear") {
+    pricingSort = "n";
+    itemSort = "n";
+    nextPage = 1;
+  } else {
+    return;
+  }
+
+  const { embed, rows } = buildItemListEmbed(nextPage, pricingSort, itemSort);
+  await interaction.update({ embeds: [embed], components: rows });
+  return;
+}
 
   if (interaction.isModalSubmit()) {
     if (!userIsAdmin(interaction.member)) {
