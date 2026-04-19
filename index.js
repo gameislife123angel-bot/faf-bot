@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {
   ActionRowBuilder,
+  ApplicationIntegrationType,
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -12,6 +13,7 @@ const {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  InteractionContextType,
   ModalBuilder,
   MessageFlags,
   REST,
@@ -819,21 +821,34 @@ const slashCommands = [
     .addIntegerOption((opt) =>
       opt.setName("qty").setDescription("New qty (0 to remove)").setRequired(true).setMinValue(0)
     ),
-].map((command) => command.toJSON());
-
-/** User install + usable in guild, DM, and private channel (Discord API v10). */
-function applyUserInstallMetadata(commandsJson) {
-  return commandsJson.map((cmd) => ({
-    ...cmd,
-    integration_types: [1],
-    contexts: [0, 1, 2],
-  }));
-}
+].map((command) =>
+  command
+    .setIntegrationTypes(ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall)
+    .setContexts(
+      InteractionContextType.Guild,
+      InteractionContextType.BotDM,
+      InteractionContextType.PrivateChannel
+    )
+    .toJSON()
+);
 
 async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
-  const body = applyUserInstallMetadata(slashCommands);
-  await rest.put(Routes.applicationCommands(config.clientId), { body });
+  const token = process.env.TOKEN;
+  if (!token) {
+    // eslint-disable-next-line no-console
+    console.error("TOKEN is missing; slash commands were not registered.");
+    return;
+  }
+  const rest = new REST({ version: "10" }).setToken(token);
+  try {
+    const registered = await rest.put(Routes.applicationCommands(config.clientId), { body: slashCommands });
+    // eslint-disable-next-line no-console
+    console.log(`Registered ${registered.length} global slash command(s).`);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Slash command registration failed:", error?.rawError ?? error?.message ?? error);
+    throw error;
+  }
 }
 
 const client = new Client({
@@ -853,7 +868,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.log(`Ready as ${readyClient.user.tag}`);
   } catch (error) {
     // eslint-disable-next-line no-console
-    console.error("Failed to register slash commands:", error);
+    console.error("Failed to register slash commands:", error?.rawError ?? error);
   }
 });
 
