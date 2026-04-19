@@ -1,7 +1,7 @@
 {
   "clientId": "1494689425114923068",
   "guildId": "1494675223780524225",
-  "prefix": "!",
+  "mainGuildId": "1494675223780524225",
   "adminRoleId": "1494699263836426381",
   "databasePath": "./data/items.json",
   "embedColor": 2468795,
@@ -10,7 +10,6 @@
   "webPort": 3000,
   "garageRequestChannelId": "1495044507731890276",
   "garageReviewerRoleId": "1494740150096363561",
-  "accessRequirementGuildId": "1494675223780524225",
   "accessInviteUrl": "https://discord.gg/yhXZ3sWC5a",
-  "dailyMessageRequirement": 7
+  "activityWarningThreshold": 5
 }
