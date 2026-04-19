@@ -148,8 +148,9 @@ function getDailyMessageCount(userId) {
   return Number(db.counts[day]?.[userId]) || 0;
 }
 
-function accessGuildId() {
-  return config.accessRequirementGuildId || config.guildId;
+/** Main FaF server — membership required (unless admin). Same as `guildId` unless overridden. */
+function mainGuildId() {
+  return config.mainGuildId || config.guildId;
 }
 
 async function userIsAdminById(client, userId) {
@@ -159,57 +160,60 @@ async function userIsAdminById(client, userId) {
   return Boolean(member?.roles?.cache?.has(config.adminRoleId));
 }
 
-async function assertGlobalAccess(client, userId) {
+/**
+ * Hard gate: must be in main guild (or admin). No activity requirement.
+ * Uses cache.get(mainGuildId) then fetch(member) as requested.
+ */
+async function assertMemberOfMainGuild(client, userId) {
+  const invite = config.accessInviteUrl || "https://discord.gg/yhXZ3sWC5a";
+  const blockMessage = `You must join our main server to use this bot: ${invite}`;
+
   if (await userIsAdminById(client, userId)) {
     return { ok: true };
   }
-  const gid = accessGuildId();
-  const guild = await client.guilds.fetch(gid).catch(() => null);
+
+  const mainId = mainGuildId();
+  let guild = client.guilds.cache.get(mainId);
   if (!guild) {
-    return { ok: false, message: "Bot cannot verify the required server. Ask an admin to set `accessRequirementGuildId`." };
+    guild = await client.guilds.fetch(mainId).catch(() => null);
   }
+  if (!guild) {
+    return { ok: false, message: blockMessage };
+  }
+
   const member = await guild.members.fetch(userId).catch(() => null);
   if (!member) {
-    const invite = config.accessInviteUrl || "https://discord.gg/yhXZ3sWC5a";
-    return { ok: false, message: `Join this server to use the bot: ${invite}` };
+    return { ok: false, message: blockMessage };
   }
-  const need = Number(config.dailyMessageRequirement) || 7;
+  return { ok: true };
+}
+
+/**
+ * Slash commands: membership + optional soft activity hint (does not block).
+ */
+async function assertMainGuildAccess(client, userId) {
+  const base = await assertMemberOfMainGuild(client, userId);
+  if (!base.ok) return base;
+  if (await userIsAdminById(client, userId)) {
+    return { ok: true };
+  }
+  const threshold = Number(config.activityWarningThreshold ?? 5);
   const count = getDailyMessageCount(userId);
-  if (count < need) {
-    const invite = config.accessInviteUrl || "https://discord.gg/yhXZ3sWC5a";
+  if (count < threshold) {
     return {
-      ok: false,
-      message: `You need **${need}** messages today in the server (you have **${count}**).\n${invite}`,
+      ok: true,
+      activityWarning: "Be active in the server to unlock full access.",
     };
   }
   return { ok: true };
 }
 
-async function replyAccessDenied(message, text) {
-  if (message.channel.type === ChannelType.DM) {
-    await message.reply(text);
-  } else {
-    await message.reply({ content: text, flags: MessageFlags.Ephemeral });
-  }
-}
-
-async function sendBotDmNotice(message, dmSend) {
-  if (message.channel.type === ChannelType.DM) {
-    await dmSend(message.channel);
-    return;
-  }
-  try {
-    const dm = await message.author.createDM();
-    await dmSend(dm);
-    await message.reply({
-      content: "Sent you a **private DM** with the result.",
-      flags: MessageFlags.Ephemeral,
-    });
-  } catch (error) {
-    await message.reply({
-      content: "I could not DM you. Enable **Allow direct messages** from server members, then try again.",
-      flags: MessageFlags.Ephemeral,
-    });
+async function replySlashWithActivityHint(interaction, payload, activityWarning) {
+  await interaction.reply(payload);
+  if (activityWarning) {
+    await interaction
+      .followUp({ content: activityWarning, flags: MessageFlags.Ephemeral })
+      .catch(() => {});
   }
 }
 
@@ -567,8 +571,53 @@ function buildItemListEmbed(page, pricingSort = "n", itemSort = "n") {
   return { embed, rows: [navRow, pricingRow, itemsRow], safePage, totalPages };
 }
 
+function buildGarageLeaderboardEmbed(mode) {
+  const garageDb = readGarageDb();
+  const scores = Object.entries(garageDb.garages).map(([userId]) => {
+    const rows = getGarageEntriesForUser(userId);
+    return {
+      userId,
+      qty: rows.reduce((sum, r) => sum + r.qty, 0),
+      value: rows.reduce((sum, r) => sum + r.totalValue, 0),
+    };
+  });
+  scores.sort((a, b) => (mode === "qty" ? b.qty - a.qty : b.value - a.value));
+  const top = scores.slice(0, 10);
+  const desc = top.length
+    ? top
+        .map((row, idx) =>
+          mode === "qty"
+            ? `${idx + 1}. <@${row.userId}> - ${formatNumber(row.qty)}`
+            : `${idx + 1}. <@${row.userId}> - ${coinsEmoji()} ${formatNumber(row.value)}`
+        )
+        .join("\n")
+    : "No garage data yet.";
+  const embed = new EmbedBuilder()
+    .setColor(config.embedColor || 0x25adff)
+    .setTitle(mode === "qty" ? "Garage Leaderboard (Qty)" : "Garage Leaderboard (Value)")
+    .setDescription(desc)
+    .setFooter({ text: "FaF Real Value" })
+    .setTimestamp();
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("garageleader:value:1")
+      .setLabel("Value")
+      .setStyle(mode === "value" ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("garageleader:qty:1")
+      .setLabel("Qty")
+      .setStyle(mode === "qty" ? ButtonStyle.Success : ButtonStyle.Secondary)
+  );
+  return { embed, row };
+}
+
 function userIsAdmin(member) {
-  return member.roles?.cache?.has(config.adminRoleId);
+  return member?.roles?.cache?.has(config.adminRoleId);
+}
+
+async function interactionUserIsAdmin(interaction) {
+  if (interaction.member && userIsAdmin(interaction.member)) return true;
+  return userIsAdminById(interaction.client, interaction.user.id);
 }
 
 function userCanReviewGarage(member) {
@@ -714,6 +763,28 @@ function buildGarageSelectRows(userId) {
 
 const slashCommands = [
   new SlashCommandBuilder()
+    .setName("value")
+    .setDescription("Show item value and value history graph")
+    .addStringOption((opt) => opt.setName("item").setDescription("Item name").setRequired(true)),
+  new SlashCommandBuilder().setName("itemlist").setDescription("Browse all tracked items"),
+  new SlashCommandBuilder()
+    .setName("garageadd")
+    .setDescription("Submit a garage add request (use in DM with the bot only)")
+    .addAttachmentOption((opt) => opt.setName("evidence").setDescription("Evidence image").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("lookup")
+    .setDescription("View a user's garage")
+    .addUserOption((opt) => opt.setName("user").setDescription("User").setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("leaderboard")
+    .setDescription("Top 10 garages")
+    .addSubcommand((s) => s.setName("value").setDescription("Sort by total value"))
+    .addSubcommand((s) => s.setName("qty").setDescription("Sort by total quantity")),
+  new SlashCommandBuilder()
+    .setName("find")
+    .setDescription("List users who own an item")
+    .addStringOption((opt) => opt.setName("item").setDescription("Item name").setRequired(true)),
+  new SlashCommandBuilder()
     .setName("additem")
     .setDescription("Add a new FaF item")
     .addAttachmentOption((opt) =>
@@ -750,11 +821,19 @@ const slashCommands = [
     ),
 ].map((command) => command.toJSON());
 
+/** User install + usable in guild, DM, and private channel (Discord API v10). */
+function applyUserInstallMetadata(commandsJson) {
+  return commandsJson.map((cmd) => ({
+    ...cmd,
+    integration_types: [1],
+    contexts: [0, 1, 2],
+  }));
+}
+
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
-  await rest.put(Routes.applicationGuildCommands(config.clientId, config.guildId), {
-    body: slashCommands,
-  });
+  const body = applyUserInstallMetadata(slashCommands);
+  await rest.put(Routes.applicationCommands(config.clientId), { body });
 }
 
 const client = new Client({
@@ -781,199 +860,20 @@ client.once(Events.ClientReady, async (readyClient) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
-  if (message.guild?.id === accessGuildId() && message.channel?.isTextBased?.()) {
+  if (message.guild?.id === mainGuildId() && message.channel?.isTextBased?.()) {
     incrementDailyMessageCount(message.author.id);
-  }
-
-  if (!message.content.startsWith(config.prefix || "!")) return;
-
-  const accessCheck = await assertGlobalAccess(message.client, message.author.id);
-  if (!accessCheck.ok) {
-    await replyAccessDenied(message, accessCheck.message);
-    return;
-  }
-
-  const [command, ...rest] = message.content.slice((config.prefix || "!").length).trim().split(" ");
-  const cmd = command?.toLowerCase();
-
-  if (cmd === "value") {
-    const query = rest.join(" ").trim();
-    if (!query) {
-      if (message.channel.type === ChannelType.DM) await message.reply("Use: `!value <item name>`");
-      else await message.reply({ content: "Use: `!value <item name>`", flags: MessageFlags.Ephemeral });
-      return;
-    }
-
-    const item = findItemByName(query);
-    if (!item) {
-      await sendBotDmNotice(message, async (ch) => {
-        await ch.send(`Item not found: **${query}**`);
-      });
-      return;
-    }
-
-    try {
-      const graph = await buildValueGraphAttachment(item);
-      const embed = buildValueEmbed(item);
-      await sendBotDmNotice(message, async (ch) => {
-        await ch.send({ embeds: [embed], files: [graph] });
-      });
-    } catch (error) {
-      await sendBotDmNotice(message, async (ch) => {
-        await ch.send("Could not build value graph for this item.");
-      });
-    }
-    return;
-  }
-
-  if (cmd === "itemlist") {
-    const { embed, rows } = buildItemListEmbed(1, "n", "n");
-    await sendBotDmNotice(message, async (ch) => {
-      await ch.send({ embeds: [embed], components: rows });
-    });
-    return;
-  }
-
-  if (cmd === "garageadd") {
-    const attachment = message.attachments.first();
-    if (!attachment) {
-      if (message.channel.type === ChannelType.DM) {
-        await message.reply("Attach an **evidence image** to the same message as `!garageadd`.");
-      } else {
-        await message.reply({
-          content: "Attach an **evidence image** to the same message as `!garageadd`, then check your DMs.",
-          flags: MessageFlags.Ephemeral,
-        });
-      }
-      return;
-    }
-    const isImage =
-      Boolean(attachment.contentType?.startsWith("image/")) ||
-      /\.(png|jpe?g|gif|webp)$/i.test(attachment.name || "");
-    if (!isImage) {
-      if (message.channel.type === ChannelType.DM) await message.reply("Evidence must be an image file.");
-      else await message.reply({ content: "Evidence must be an image file.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const rows = buildGarageSelectRows(message.author.id);
-    if (!rows) {
-      await sendBotDmNotice(message, async (ch) => {
-        await ch.send("No items available in item list yet.");
-      });
-      return;
-    }
-
-    client.pendingGarageAddEvidence?.delete(message.author.id);
-    client.pendingGarageSelections?.delete(message.author.id);
-
-    client.pendingGarageAddEvidence ??= new Map();
-    client.pendingGarageAddEvidence.set(message.author.id, {
-      evidenceUrl: attachment.url,
-      evidenceName: attachment.name || "evidence",
-    });
-    client.pendingGarageSelections ??= new Map();
-    client.pendingGarageSelections.set(message.author.id, {
-      evidenceUrl: attachment.url,
-      evidenceName: attachment.name || "evidence",
-      selectedNames: [],
-      sessionActive: true,
-    });
-
-    const dmPayload = {
-      content:
-        "**Garage add (private)**\n1) Select items below (up to 25).\n2) You will get a form for **qty** (`item=qty, item2=qty`).\n3) Your request is sent for review.",
-      components: rows,
-    };
-
-    if (message.channel.type === ChannelType.DM) {
-      await message.reply(dmPayload);
-    } else {
-      try {
-        const dm = await message.author.createDM();
-        await dm.send(dmPayload);
-        await message.reply({
-          content: "Check your **DMs** with the bot to continue (garage add is private).",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch (error) {
-        await message.reply({
-          content: "I could not DM you. Enable **Allow direct messages** from server members, then run `!garageadd` again with your image attached.",
-          flags: MessageFlags.Ephemeral,
-        });
-      }
-    }
-    return;
-  }
-
-  if (cmd === "lookup") {
-    const targetRaw = rest.join(" ").trim();
-    const targetId = parseLookupTarget(targetRaw);
-    if (!targetId) {
-      if (message.channel.type === ChannelType.DM) await message.reply("Use: `!lookup <@user|userId>`");
-      else await message.reply({ content: "Use: `!lookup <@user|userId>`", flags: MessageFlags.Ephemeral });
-      return;
-    }
-
-    try {
-      const targetUser = await message.client.users.fetch(targetId);
-      const rows = getGarageEntriesForUser(targetId);
-      const { embed, row } = buildGarageLookupEmbed(targetUser, rows, 1);
-      await sendBotDmNotice(message, async (ch) => {
-        await ch.send({ embeds: [embed], components: [row] });
-      });
-    } catch (error) {
-      await sendBotDmNotice(message, async (ch) => {
-        await ch.send("Could not find that user.");
-      });
-    }
-    return;
-  }
-
-  if (cmd === "leaderboard") {
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("garageleader:value:1")
-        .setLabel("Value")
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId("garageleader:qty:1")
-        .setLabel("Qty")
-        .setStyle(ButtonStyle.Secondary)
-    );
-    await sendBotDmNotice(message, async (ch) => {
-      await ch.send({
-        content: "Choose leaderboard type:",
-        components: [row],
-      });
-    });
-    return;
-  }
-
-  if (cmd === "find") {
-    const query = rest.join(" ").trim();
-    if (!query) {
-      if (message.channel.type === ChannelType.DM) await message.reply("Use: `!find <item name>`");
-      else await message.reply({ content: "Use: `!find <item name>`", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const item = findItemByName(query);
-    if (!item) {
-      await sendBotDmNotice(message, async (ch) => {
-        await ch.send(`Item not found: **${query}**`);
-      });
-      return;
-    }
-    const owners = findUsersOwningItem(item).sort((a, b) => b.qty - a.qty);
-    const { embed, row } = buildFindOwnersEmbed(item, owners, 1);
-    await sendBotDmNotice(message, async (ch) => {
-      await ch.send({ embeds: [embed], components: [row] });
-    });
-    return;
   }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isChatInputCommand()) {
+    const gate = await assertMainGuildAccess(interaction.client, interaction.user.id);
+    if (!gate.ok) {
+      await interaction.reply({ content: gate.message, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const activityWarn = gate.activityWarning;
+
     const adminOnlyCommands = new Set([
       "additem",
       "edititem",
@@ -981,11 +881,133 @@ client.on(Events.InteractionCreate, async (interaction) => {
       "garagedelete",
       "garageedituser",
     ]);
-    if (adminOnlyCommands.has(interaction.commandName) && !userIsAdmin(interaction.member)) {
+    if (adminOnlyCommands.has(interaction.commandName) && !(await interactionUserIsAdmin(interaction))) {
       await interaction.reply({
         content: "You do not have permission to use this command.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
+      return;
+    }
+
+    if (interaction.commandName === "value") {
+      const query = interaction.options.getString("item", true).trim();
+      const item = findItemByName(query);
+      if (!item) {
+        await interaction.reply({
+          content: `Item not found: **${query}**`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      try {
+        const graph = await buildValueGraphAttachment(item);
+        const embed = buildValueEmbed(item);
+        await replySlashWithActivityHint(interaction, { embeds: [embed], files: [graph] }, activityWarn);
+      } catch (error) {
+        await interaction.reply({
+          content: "Could not build value graph for this item.",
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+      return;
+    }
+
+    if (interaction.commandName === "itemlist") {
+      const { embed, rows } = buildItemListEmbed(1, "n", "n");
+      await replySlashWithActivityHint(interaction, { embeds: [embed], components: rows }, activityWarn);
+      return;
+    }
+
+    if (interaction.commandName === "garageadd") {
+      if (interaction.inGuild()) {
+        await interaction.reply({
+          content:
+            "`/garageadd` only works in **Direct Messages** with the bot.\nOpen my profile → **Message**, then run `/garageadd` and attach your **evidence** image.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const attachment = interaction.options.getAttachment("evidence", true);
+      const isImage =
+        Boolean(attachment.contentType?.startsWith("image/")) ||
+        /\.(png|jpe?g|gif|webp)$/i.test(attachment.name || "");
+      if (!isImage) {
+        await interaction.reply({
+          content: "Evidence must be an image file.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const rows = buildGarageSelectRows(interaction.user.id);
+      if (!rows) {
+        await interaction.reply({
+          content: "No items available in item list yet.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      client.pendingGarageAddEvidence?.delete(interaction.user.id);
+      client.pendingGarageSelections?.delete(interaction.user.id);
+      client.pendingGarageAddEvidence ??= new Map();
+      client.pendingGarageAddEvidence.set(interaction.user.id, {
+        evidenceUrl: attachment.url,
+        evidenceName: attachment.name || "evidence",
+      });
+      client.pendingGarageSelections ??= new Map();
+      client.pendingGarageSelections.set(interaction.user.id, {
+        evidenceUrl: attachment.url,
+        evidenceName: attachment.name || "evidence",
+        selectedNames: [],
+        sessionActive: true,
+      });
+      await replySlashWithActivityHint(
+        interaction,
+        {
+          content:
+            "**Garage add (DM only)**\n1) Select items below (up to 25).\n2) You will get a form for **qty** (`item=qty, item2=qty`).\n3) Your request is sent for review.",
+          components: rows,
+        },
+        activityWarn
+      );
+      return;
+    }
+
+    if (interaction.commandName === "lookup") {
+      const targetUser = interaction.options.getUser("user", true);
+      try {
+        const rows = getGarageEntriesForUser(targetUser.id);
+        const { embed, row } = buildGarageLookupEmbed(targetUser, rows, 1);
+        await replySlashWithActivityHint(interaction, { embeds: [embed], components: [row] }, activityWarn);
+      } catch (error) {
+        await interaction.reply({
+          content: "Could not load that user.",
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+      return;
+    }
+
+    if (interaction.commandName === "leaderboard") {
+      const sub = interaction.options.getSubcommand(true);
+      const mode = sub === "qty" ? "qty" : "value";
+      const { embed, row } = buildGarageLeaderboardEmbed(mode);
+      await replySlashWithActivityHint(interaction, { embeds: [embed], components: [row] }, activityWarn);
+      return;
+    }
+
+    if (interaction.commandName === "find") {
+      const query = interaction.options.getString("item", true).trim();
+      const item = findItemByName(query);
+      if (!item) {
+        await interaction.reply({
+          content: `Item not found: **${query}**`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const owners = findUsersOwningItem(item).sort((a, b) => b.qty - a.qty);
+      const { embed, row } = buildFindOwnersEmbed(item, owners, 1);
+      await replySlashWithActivityHint(interaction, { embeds: [embed], components: [row] }, activityWarn);
       return;
     }
 
@@ -1139,11 +1161,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setStyle(ButtonStyle.Secondary)
       );
 
-      await interaction.reply({
-        content: `Are you sure you want to delete **${item.name}**?`,
-        components: [row],
-        ephemeral: true,
-      });
+      await replySlashWithActivityHint(
+        interaction,
+        {
+          content: `Are you sure you want to delete **${item.name}**?`,
+          components: [row],
+          flags: MessageFlags.Ephemeral,
+        },
+        activityWarn
+      );
       return;
     }
 
@@ -1152,10 +1178,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const garageDb = readGarageDb();
       delete garageDb.garages[target.id];
       writeGarageDb(garageDb);
-      await interaction.reply({
-        content: `Deleted full garage for <@${target.id}>.`,
-        ephemeral: true,
-      });
+      await replySlashWithActivityHint(
+        interaction,
+        {
+          content: `Deleted full garage for <@${target.id}>.`,
+          flags: MessageFlags.Ephemeral,
+        },
+        activityWarn
+      );
       return;
     }
 
@@ -1185,10 +1215,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       garageDb.garages[target.id] = entries;
       writeGarageDb(garageDb);
-      await interaction.reply({
-        content: `Garage updated for <@${target.id}>: **${item.name}** qty is now **${qty}**.`,
-        ephemeral: true,
-      });
+      await replySlashWithActivityHint(
+        interaction,
+        {
+          content: `Garage updated for <@${target.id}>: **${item.name}** qty is now **${qty}**.`,
+          flags: MessageFlags.Ephemeral,
+        },
+        activityWarn
+      );
       return;
     }
   }
@@ -1210,16 +1244,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
         return;
       }
-      const access = await assertGlobalAccess(interaction.client, interaction.user.id);
-      if (!access.ok) {
-        await interaction.reply({ content: access.message, flags: MessageFlags.Ephemeral });
+      const memGate = await assertMemberOfMainGuild(interaction.client, interaction.user.id);
+      if (!memGate.ok) {
+        await interaction.reply({ content: memGate.message, flags: MessageFlags.Ephemeral });
         return;
       }
       client.pendingGarageSelections ??= new Map();
       const current = client.pendingGarageSelections.get(interaction.user.id) || {};
       if (!current.sessionActive || !current.evidenceUrl) {
         await interaction.reply({
-          content: "This garage session is closed. Run `!garageadd` again with a new evidence image.",
+          content: "This garage session is closed. Run `/garageadd` again with a new evidence image.",
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -1242,6 +1276,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.isButton()) {
+    const buttonNeedsMainGuild =
+      interaction.customId.startsWith("garageleader:") ||
+      interaction.customId.startsWith("garagelookup:") ||
+      interaction.customId.startsWith("itemfind:") ||
+      interaction.customId.startsWith("itemlist:");
+    if (buttonNeedsMainGuild) {
+      const g = await assertMemberOfMainGuild(interaction.client, interaction.user.id);
+      if (!g.ok) {
+        await interaction.reply({ content: g.message, flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+
     if (interaction.customId.startsWith("garagereview:")) {
       const [, action, requestId] = interaction.customId.split(":");
       if (!userCanReviewGarage(interaction.member)) {
@@ -1261,42 +1308,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.customId.startsWith("garageleader:")) {
       const [, mode] = interaction.customId.split(":");
-      const garageDb = readGarageDb();
-      const scores = Object.entries(garageDb.garages).map(([userId, entries]) => {
-        const rows = getGarageEntriesForUser(userId);
-        return {
-          userId,
-          qty: rows.reduce((sum, r) => sum + r.qty, 0),
-          value: rows.reduce((sum, r) => sum + r.totalValue, 0),
-        };
-      });
-      scores.sort((a, b) => (mode === "qty" ? b.qty - a.qty : b.value - a.value));
-      const top = scores.slice(0, 10);
-      const desc = top.length
-        ? top
-            .map((row, idx) =>
-              mode === "qty"
-                ? `${idx + 1}. <@${row.userId}> - ${formatNumber(row.qty)}`
-                : `${idx + 1}. <@${row.userId}> - ${coinsEmoji()} ${formatNumber(row.value)}`
-            )
-            .join("\n")
-        : "No garage data yet.";
-      const embed = new EmbedBuilder()
-        .setColor(config.embedColor || 0x25adff)
-        .setTitle(mode === "qty" ? "Garage Leaderboard (Qty)" : "Garage Leaderboard (Value)")
-        .setDescription(desc)
-        .setFooter({ text: "FaF Real Value" })
-        .setTimestamp();
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("garageleader:value:1")
-          .setLabel("Value")
-          .setStyle(mode === "value" ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("garageleader:qty:1")
-          .setLabel("Qty")
-          .setStyle(mode === "qty" ? ButtonStyle.Success : ButtonStyle.Secondary)
-      );
+      const { embed, row } = buildGarageLeaderboardEmbed(mode);
       await interaction.update({ embeds: [embed], components: [row], content: "" });
       return;
     }
@@ -1423,9 +1435,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
         return;
       }
-      const access = await assertGlobalAccess(interaction.client, interaction.user.id);
-      if (!access.ok) {
-        await interaction.reply({ content: access.message, flags: MessageFlags.Ephemeral });
+      const memGate = await assertMemberOfMainGuild(interaction.client, interaction.user.id);
+      if (!memGate.ok) {
+        await interaction.reply({ content: memGate.message, flags: MessageFlags.Ephemeral });
         return;
       }
       client.garageSubmitLocks ??= new Set();
@@ -1441,7 +1453,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const pending = client.pendingGarageSelections?.get(interaction.user.id);
         if (!pending?.selectedNames?.length || !pending?.evidenceUrl || !pending.sessionActive) {
           await interaction.reply({
-            content: "Selection or evidence missing. Start again with `!garageadd` and attach your evidence image.",
+            content: "Selection or evidence missing. Start again with `/garageadd` and attach your evidence image.",
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -1563,10 +1575,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    if (!userIsAdmin(interaction.member)) {
+    if (!(await interactionUserIsAdmin(interaction))) {
       await interaction.reply({
         content: "You do not have permission to submit this form.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
