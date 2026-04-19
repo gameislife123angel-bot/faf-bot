@@ -9,5 +9,8 @@
   "emojiHalfstarId": "1494690389389611119",
   "webPort": 3000,
   "garageRequestChannelId": "1495044507731890276",
-  "garageReviewerRoleId": "1494740150096363561"
+  "garageReviewerRoleId": "1494740150096363561",
+  "accessRequirementGuildId": "1494675223780524225",
+  "accessInviteUrl": "https://discord.gg/yhXZ3sWC5a",
+  "dailyMessageRequirement": 7
 }
